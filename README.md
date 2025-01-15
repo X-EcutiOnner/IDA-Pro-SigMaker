@@ -1,5 +1,5 @@
 # IDA Pro SigMaker
-Signature Maker Plugin for IDA Pro 8 and 9
+Signature Maker Plugin for IDA Pro 9 and 8
 
 Plugin downloads are in the [Releases](https://github.com/A200K/IDA-Pro-SigMaker/releases/) section
 
@@ -55,10 +55,13 @@ If the CPU doesn't support AVX2, it will fallback to the slow builtin IDA functi
 ___
 ## Building
 
-If you want to compile for IDA 9, check out the [IDA9 branch](https://github.com/A200K/IDA-Pro-SigMaker/tree/IDA9)
-
 ### Requirements
-- IDA Pro Plugin SDK 8 / 9
+- IDA Pro Plugin SDK **9**
+  - Extract content in **SDK/9**
+- or IDA Pro Plugin SDK **9 (Beta)**
+  - Extract content in **SDK/9beta**
+- or IDA Pro Plugin SDK **8**
+  - Extract content in **SDK/8**
 
 ### Setup
 For your convenience, here are the steps to get started:
