@@ -1,106 +1,24 @@
 #include "Main.h"
 #include "Utils.h"
 #include "SignatureUtils.h"
+#include "IDAAPICompat.hpp"
 
 #define QIS_SIGNATURE_USE_AVX2 1 
 #include <qis/signature.hpp>
 
-bool IS_ARM = false;
+uint32_t PROCESSOR_ARCH;
+
 bool USE_QIS_SIGNATURE = false;
+bool WILDCARD_OPTIMIZED_INSTRUCTION = true;
 size_t PRINT_TOP_X = 5;
 size_t MAX_SINGLE_SIGNATURE_LENGTH = 1000;
 size_t MAX_XREF_SIGNATURE_LENGTH = 250;
 
 std::vector<uint8_t> FILE_BUFFER = {};
 
-// Exclude o_imm for shorter signatures
-static uint32_t WildcardableOperandTypeBitmask =
-BIT( o_reg ) | BIT( o_mem ) | BIT( o_phrase ) | BIT( o_displ ) | BIT( o_far ) | BIT( o_near ) | BIT( o_imm ) |
-BIT( o_idpspec0 ) | BIT( o_idpspec1 ) | BIT( o_idpspec2 ) | BIT( o_idpspec3 ) | BIT( o_idpspec4 ) | BIT( o_idpspec5 );
-
-// IDA SDK compatibility  functions
-#define IDA_9_VERSION 900
-inline const char* compat_inf_get_procname( ) {
-#if IDP_INTERFACE_VERSION >= IDA_9_VERSION // IDA 9
-	return inf_get_procname( ).c_str( );
-#else // IDA 8
-	return inf.procname;
-#endif
-}
-
-inline ea_t compat_inf_get_min_ea( ) {
-#if IDP_INTERFACE_VERSION >= IDA_9_VERSION // IDA 9
-	return inf_get_min_ea( );
-#else // IDA 8
-	return inf.min_ea;
-#endif
-}
-
-inline ea_t compat_inf_get_max_ea( ) {
-#if IDP_INTERFACE_VERSION >= IDA_9_VERSION // IDA 9
-	return inf_get_max_ea( );
-#else // IDA 8
-	return inf.max_ea;
-#endif
-}
-
-inline ea_t compat_bin_search( ea_t start_ea, ea_t end_ea, const compiled_binpat_vec_t& data, int flags ) {
-#if IDP_INTERFACE_VERSION >= 900 // IDA 9
-#ifdef __SDK_BETA__ // IDA 9 Beta
-	return bin_search3( start_ea, end_ea, data, flags );
-#else // IDA 9 SP1
-	return bin_search( start_ea, end_ea, data, flags );
-#endif
-#else // IDA 8
-	return bin_search2( start_ea, end_ea, data, flags );
-#endif
-}
-
-static bool IsARM( ) {
-	return std::string_view( "ARM" ) == compat_inf_get_procname( );
-}
-
-static bool GetOperandOffsetARM( const insn_t& instruction, uint8_t* operandOffset, uint8_t* operandLength ) {
-
-	// Iterate all operands
-	for( const auto& op : instruction.ops ) {
-		// For ARM, we have to filter a bit though, only wildcard those operand types
-		switch( op.type ) {
-		case o_mem:
-		case o_far:
-		case o_near:
-		case o_phrase:
-		case o_displ:
-		case o_imm:
-			break;
-		default:
-			continue;
-		}
-
-		*operandOffset = op.offb;
-
-		// This is somewhat of a hack because IDA api does not provide more info 
-		// I always assume the operand is 3 bytes long with 1 byte operator
-		if( instruction.size == 4 ) {
-			*operandLength = 3;
-		}
-		// I saw some ADRL instruction having 8 bytes
-		if( instruction.size == 8 ) {
-			*operandLength = 7;
-		}
-		return true;
-	}
-	return false;
-}
+static uint32_t WildcardableOperandTypeBitmask = 0;
 
 static bool GetOperandOffset( const insn_t& instruction, uint8_t* operandOffset, uint8_t* operandLength, uint32_t operandTypeBitmask ) {
-
-	// Handle ARM
-	if( IS_ARM ) {
-		return GetOperandOffsetARM( instruction, operandOffset, operandLength );
-	}
-
-	// Handle metapc x86/64
 
 	// Iterate all operands
 	for( const auto& op : instruction.ops ) {
@@ -108,17 +26,46 @@ static bool GetOperandOffset( const insn_t& instruction, uint8_t* operandOffset,
 		if( op.type == o_void ) {
 			continue;
 		}
-		// offb = 0 means unknown
-		if( op.offb == 0 ) {
-			continue;
-		}
+
 		// Apply operand bitmask filter
 		if( ( BIT( op.type ) & operandTypeBitmask ) == 0 ) {
 			continue;
 		}
 
 		*operandOffset = op.offb;
-		*operandLength = instruction.size - op.offb;
+
+		bool isOptimizedInstr = false;
+		// Find operand length based on processor arch
+		switch( PROCESSOR_ARCH ) {
+		case PLFM_ARM: // ARM, since operands are at the beginning
+		{
+			// This is somewhat of a hack because IDA api does not provide more info for ARM
+			// I always assume the operand is 3 bytes long with 1 byte operator
+			if( instruction.size == 4 ) {
+				*operandLength = 3;
+			}
+			// I saw some ADRL instruction having 8 bytes
+			if( instruction.size == 8 ) {
+				*operandLength = 7;
+			}
+			break;
+		}
+		case PLFM_386: // METAPC
+		{
+			// Usually the instruction is optimized and the operand is part of the operator and thus can't be described by offb
+			if( op.offb == 0 ) {
+				isOptimizedInstr = true;
+			}
+		}
+		default: // Everything else
+			*operandLength = instruction.size - op.offb;
+			break;
+		}
+
+		if( isOptimizedInstr && !WILDCARD_OPTIMIZED_INSTRUCTION ) {
+	 		continue;
+		}
+
 		return true;
 	}
 	return false;
@@ -599,7 +546,9 @@ static void SearchSignatureString( std::string input ) {
 }
 
 static void ConfigureOperandWildcardBitmask( ) {
-	const char format[] =
+
+	std::stringstream formString;
+	const char baseOptions[] =
 		"STARTITEM 0\n"                                                         // TabStop
 		"Wildcardable Operands\n"                                               // Title
 		"Select operand types that should be wildcarded:\n"                     // Header
@@ -609,11 +558,50 @@ static void ConfigureOperandWildcardBitmask( ) {
 		"<Memory Ref [Base Reg + Index Reg + Displacement]:C>\n"                // Radio Button 3
 		"<Immediate Value:C>\n"                                                 // Radio Button 4
 		"<Immediate Far Address  (CODE):C>\n"                                   // Radio Button 5
-		"<Immediate Near Address (CODE):C>>\n";                                 // Radio Button 6
+		"<Immediate Near Address (CODE):C>";                                    // Radio Button 6
+	formString << baseOptions;
+
+	// Processor specific wildcards
+	switch( PROCESSOR_ARCH ) {
+	case PLFM_386:
+		formString << "\n";
+		formString << "<Trace Register:C>\n";
+		formString << "<Debug Register:C>\n";
+		formString << "<Control Register:C>\n";
+		formString << "<Floating Point Register:C>\n";
+		formString << "<MMX Register:C>\n";
+		formString << "<XMM Register:C>\n";
+		formString << "<YMM Register:C>\n";
+		formString << "<ZMM Register:C>\n";
+		formString << "<Opmask Register:C>>\n";
+		break;
+	case PLFM_ARM:
+		formString << "\n";
+		formString << "<(Unused):C>\n";
+		formString << "<Register list (for LDM/STM):C>\n";
+		formString << "<Coprocessor register list (for CDP):C>\n";
+		formString << "<Coprocessor register (for LDC/STC):C>\n";
+		formString << "<Floating point register list:C>\n";
+		formString << "<Arbitrary text stored in the operand:C>\n";
+		formString << "<ARM condition as an operand:C>>\n";
+		break;
+	case PLFM_PPC:
+		formString << "\n";
+		formString << "<Special purpose register:C>\n";
+		formString << "<Two FPRs:C>\n";
+		formString << "<SH & MB & ME:C>\n";
+		formString << "<crfield:C>\n";
+		formString << "<crbit:C>\n";
+		formString << "<Device control register:C>>\n";
+		break;
+	default:
+		formString << ">\n";
+		break;
+	}
 
 	// Shift by one because we skip o_void
 	uint32_t options = WildcardableOperandTypeBitmask >> 1;
-	if( ask_form( format, &options ) ) {
+	if( ask_form( formString.str( ).c_str( ), &options ) ) {
 		WildcardableOperandTypeBitmask = ( options << 1 );
 	}
 }
@@ -625,6 +613,7 @@ static void ConfigureOptions( ) {
 		"<#Print top X shortest signatures when generating xref signatures#Print top X XREF signatures     :u::5::>\n"                           // Number 0
 		"<#Stop after reaching X bytes when generating a single signature#Maximum single signature length :u::5::>\n"							 // Number 1
 		"<#Stop after reaching X bytes when generating xref signatures#Maximum xref signature length   :u::5::>\n";                              // Number 2
+
 	if( ask_form( format, &PRINT_TOP_X, &MAX_SINGLE_SIGNATURE_LENGTH, &MAX_XREF_SIGNATURE_LENGTH ) ) {
 	}
 }
@@ -632,8 +621,30 @@ static void ConfigureOptions( ) {
 bool idaapi plugin_ctx_t::run( size_t ) {
 
 	// Check what processor we have
-	if( IsARM( ) ) {
-		IS_ARM = true;
+	PROCESSOR_ARCH = get_ph( )->id;
+
+	// Default wildcard setting depending on processor arch
+	if( WildcardableOperandTypeBitmask == 0 ) {
+		switch( PROCESSOR_ARCH ) {
+		case PLFM_386:
+			WildcardableOperandTypeBitmask =
+				/*BIT( o_reg ) | */ BIT( o_mem ) | BIT( o_phrase ) | BIT( o_displ ) | BIT( o_far ) | BIT( o_near ) | BIT( o_imm ) |
+				BIT( o_trreg ) | BIT( o_dbreg ) | BIT( o_crreg ) | BIT( o_fpreg ) | BIT( o_mmxreg ) | BIT( o_xmmreg ) | BIT( o_xmmreg ) | BIT( o_ymmreg ) | BIT( o_zmmreg ) | BIT( o_kreg );
+			break;
+		case PLFM_ARM:
+			WildcardableOperandTypeBitmask =
+				BIT( o_mem ) | BIT( o_phrase ) | BIT( o_displ ) | BIT( o_far ) | BIT( o_near ) | BIT( o_imm );
+			// BIT( o_reg ) | BIT( o_idpspec1 ) | BIT( o_idpspec2 ) | BIT( o_idpspec3 ) | BIT( o_idpspec4 ) | BIT( o_idpspec5 ) | BIT( o_idpspec5 + 1 );
+			// o_reglist, o_creglist, o_creg, o_fpreglist, o_text, o_cond
+			break;
+		case PLFM_MIPS:
+			WildcardableOperandTypeBitmask =
+				BIT( o_mem ) | BIT( o_far ) | BIT( o_near );
+			break;
+		default:
+			WildcardableOperandTypeBitmask =
+				BIT( o_mem ) | BIT( o_phrase ) | BIT( o_displ ) | BIT( o_far ) | BIT( o_near ) | BIT( o_imm );
+		}
 	}
 
 	// Check for AVX2, to use qis' signature scanning library for faster signature creation
@@ -655,9 +666,10 @@ bool idaapi plugin_ctx_t::run( size_t ) {
 		"<#Example - \\xE8\\x00\\x00\\x00\\x00\\x45\\x33\\xF6\\x66\\x44\\x89\\x34\\x33 x????xxxxxxxx#C Byte Array String Signature + String mask : R>\n"              // Radio Button 2
 		"<#Example - 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33 0b1111111100001#C Bytes Signature + Bitmask:R>>\n"                  // Radio Button 3
 
-		"Options:\n"                                                                                                                                                  // Title
+		"Quick Options:\n"                                                                                                                                                  // Title
 		"<#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:C>\n"                                                   // Checkbox Button 0                                            
-		"<#Don't stop signature generation when reaching end of function#Continue when leaving function scope:C>>\n"                                                  // Checkbox Button 1
+		"<#Don't stop signature generation when reaching end of function#Continue when leaving function scope:C>\n"                                                   // Checkbox Button 1
+		"<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:C>>\n"        // Checkbox Button 2																										  // Checkbox Button 2
 		"<#Configure operand types that should be wildcarded#Operand types...:B::::>"                                                                                 // Button 0
 		"<#Other options#Options...:B::::>\n";                                                                                                                        // Button 1
 
@@ -673,11 +685,12 @@ bool idaapi plugin_ctx_t::run( size_t ) {
 
 	static short action = 0;
 	static short outputFormat = 0;
-	static short options = ( 1 << 0 | 0 << 1 );
+	static short options = ( 1 << 0 | 0 << 1 | WILDCARD_OPTIMIZED_INSTRUCTION << 2 );
 
 	if( ask_form( formString.str( ).c_str( ), &action, &outputFormat, &options, &ConfigureOperandWildcardBitmask, &ConfigureOptions ) ) {
 		const auto wildcardOperands = options & ( 1 << 0 );
 		const auto continueOutsideOfFunction = options & ( 1 << 1 );
+		WILDCARD_OPTIMIZED_INSTRUCTION = options & ( 1 << 2 );
 
 		const auto sigType = static_cast<SignatureType>( outputFormat );
 		switch( action ) {

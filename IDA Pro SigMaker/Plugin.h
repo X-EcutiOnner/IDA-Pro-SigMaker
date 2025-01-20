@@ -5,6 +5,9 @@
 #include <loader.hpp>
 #include <search.hpp>
 
+// Architectures
+#include <intel.hpp>
+
 // Plugin specific definitions
 
 struct plugin_ctx_t : public plugmod_t {
